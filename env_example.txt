@@ -1,0 +1,49 @@
+# Example environment variables for the multi-agent customer service system
+# Copy this file to .env and edit as needed
+
+# ===== LLM provider (any OpenAI-compatible endpoint) =====
+# These THREE must be self-consistent: the model name must exist on the chosen provider.
+# Example A - SiliconFlow:
+#   OPENAI_BASE_URL=https://api.siliconflow.cn/v1
+#   OPENAI_MODEL=Qwen/Qwen3-8B
+# Example B - DeepSeek:
+#   OPENAI_BASE_URL=https://api.deepseek.com
+#   OPENAI_MODEL=<your-provider's-model-id>
+OPENAI_API_KEY=your_api_key_here
+OPENAI_BASE_URL=https://api.siliconflow.cn/v1
+OPENAI_MODEL=Qwen/Qwen3-8B
+
+# ===== HTTP client =====
+HTTP_TIMEOUT=30
+HTTP_MAX_RETRIES=3
+
+# ===== Logging =====
+LOG_LEVEL=INFO
+
+# ===== Web 服务 (web_app.py) =====
+WEB_PORT=5000
+
+# LangGraph HTTP API (see chat_web_service.py)
+# LANGGRAPH_API_URL=http://127.0.0.1:2024
+# LANGGRAPH_GRAPH_NAME=customer_service
+
+# ===== Notes =====
+
+# 1. API key
+# Sign up at your provider's console and create an API key.
+
+# 2. Model choice
+# Verify the exact model id in your provider's docs BEFORE configuring.
+# A one-off real request is the cheapest way to confirm it.
+# SiliconFlow examples:
+# - Qwen/QwQ-32B (strongest)
+# - Qwen/Qwen3-8B (good cost/performance)
+# - Qwen/Qwen3-14B (better quality)
+
+# 3. Optional overrides
+# To change timeout or retries, edit e.g.:
+# HTTP_TIMEOUT=60
+# HTTP_MAX_RETRIES=5
+
+# Windows: if `langgraph dev` fails loading .env with UnicodeDecodeError, keep comments
+# ASCII-only (as here) or save .env as UTF-8 with BOM.
