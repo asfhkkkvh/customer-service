@@ -10,7 +10,7 @@ from typing import Any, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-#: 允许的分类标签。与 multi_agent_customer_service.ROUTE_TARGETS 的标签键一一对应，
+#: 允许的分类标签。与 workflow.graph.ROUTE_TARGETS 的标签键一一对应，
 #: 一致性由 tests/test_routing.py 保证。
 CLASS_LABELS: Tuple[str, ...] = (
     "product_info",

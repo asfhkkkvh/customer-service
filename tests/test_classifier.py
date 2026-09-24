@@ -2,7 +2,7 @@
 
 import pytest
 
-from tools.query_tools import (
+from workflow.classifier import (
     CLASS_LABELS,
     FALLBACK_LABEL,
     classify_query,

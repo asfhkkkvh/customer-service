@@ -62,7 +62,7 @@ def fake_llm():
 def build_graph(monkeypatch):
     """返回一个构造器：传入假 LLM，得到 (主模块, 已编译的图)。"""
     def _build(llm):
-        import multi_agent_customer_service as main
+        import workflow.graph as main
         monkeypatch.setattr(main, "get_llm", lambda: llm)
         return main, main.make_graph()
 

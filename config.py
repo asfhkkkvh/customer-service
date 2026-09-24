@@ -11,10 +11,10 @@ from dotenv import load_dotenv
 # 加载环境变量
 load_dotenv()
 
-# OpenAI 兼容 API 配置（默认对齐硅基流动；换服务商只需改这三个环境变量）
+# OpenAI 兼容 API 配置（默认对齐 DeepSeek；换服务商只需改这三个环境变量）
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.siliconflow.cn/v1")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "Qwen/Qwen3-8B")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "deepseek-chat")
 
 # HTTP 请求配置
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))

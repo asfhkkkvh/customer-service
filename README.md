@@ -40,7 +40,7 @@
 
 ```
 customer-service-ai-agent/
-├── multi_agents/                 # 智能体模块
+├── multi_agents/                 # 智能体模块（Agent 一块）
 │   ├── __init__.py
 │   ├── base_agent.py             # 基类：统一 process 模板
 │   ├── knowledge.py              # 本地召回层（关键词打分 + 片段渲染）
@@ -49,12 +49,13 @@ customer-service-ai-agent/
 │   ├── billing_agent.py
 │   ├── complaint_agent.py
 │   └── general_agent.py
+├── workflow/                     # 流程模块（图编排一块）
+│   ├── __init__.py
+│   ├── graph.py                  # LangGraph 图定义（节点 / 条件边 / 路由表）
+│   └── classifier.py             # 意图分类 + 标签归一化（图的固定第一跳）
 ├── data/knowledge/               # 领域知识数据（JSON）
 │   ├── product.json  tech.json  billing.json
 │   └── complaint.json  general.json
-├── tools/
-│   ├── __init__.py
-│   └── query_tools.py            # 查询分类 + 标签归一化
 ├── templates/index.html          # 单页前端
 ├── tests/                        # pytest（离线，打桩 requests 与 LLM）
 │   ├── conftest.py
@@ -65,7 +66,6 @@ customer-service-ai-agent/
 │   ├── test_session_isolation.py # 会话隔离回归
 │   └── test_web_api.py           # Web API 契约
 ├── config.py                     # 集中配置
-├── multi_agent_customer_service.py  # LangGraph 工作流定义
 ├── chat_web_service.py           # LangGraph REST 调用与会话管理
 ├── web_app.py                    # FastAPI 路由
 ├── langgraph.json                # LangGraph 平台部署配置
@@ -81,7 +81,7 @@ customer-service-ai-agent/
 
 - LLM 分类器输出 6 类固定标签：`product_info` / `technical_support` / `billing` /
   `complaint` / `general_inquiry` / `out_of_scope`
-- **标签归一化层**（`tools/query_tools.py`）处理模型的脏输出：带解释前缀
+- **标签归一化层**（`workflow/classifier.py`）处理模型的脏输出：带解释前缀
   （`分类结果：billing`）、带标点、带换行、大小写不一致、连字符变体
   （`technical-support`）。按标签长度降序做子串匹配，避免短标签抢走长标签
 - 分类异常一律降级到 `general_inquiry`，**图执行不会中断**
@@ -173,7 +173,7 @@ pip install -U "langgraph-cli[inmem]"
 ### 3. 图结构自检
 
 ```bash
-python multi_agent_customer_service.py
+python -m workflow.graph
 ```
 
 会构建图、打印节点与路由表，并断言「路由表键集 == 分类标签集」——
@@ -269,13 +269,13 @@ python ./web_app.py
 1. 在 `multi_agents/` 下新建文件，继承 `BaseAgent`，只声明 `domain_prompt`、
    `knowledge_label` 和知识库文件名（**不再需要自己实现 `process`**）
 2. 在 `data/knowledge/` 下新增对应 JSON（类目 + `keywords` + `items`）
-3. 在 `multi_agents/__init__.py` 导出，并加入 `multi_agent_customer_service.AGENT_FACTORIES`
-4. 在 `tools/query_tools.CLASS_LABELS` 增加标签，并在 `ROUTE_TARGETS` 里指向新节点
+3. 在 `multi_agents/__init__.py` 导出，并加入 `workflow.graph.AGENT_FACTORIES`
+4. 在 `workflow/classifier.CLASS_LABELS` 增加标签，并在 `ROUTE_TARGETS` 里指向新节点
 5. 运行 `pytest tests/test_routing.py` —— 它会校验标签集与路由表是否对齐
 
 ### 修改工作流程
 
-图结构在 `multi_agent_customer_service.make_graph()` 里用代码显式声明。
+图结构在 `workflow.graph.make_graph()` 里用代码显式声明。
 `langgraph.json` 只负责声明平台部署入口（哪个文件、哪个函数），不描述图结构。
 
 ## 技术架构

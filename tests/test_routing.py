@@ -6,11 +6,11 @@
 
 from conftest import node_ids
 
-from tools.query_tools import CLASS_LABELS
+from workflow.classifier import CLASS_LABELS
 
 
 def test_route_table_covers_every_classifier_label():
-    from multi_agent_customer_service import EMPTY_QUERY_LABEL, ROUTE_TARGETS
+    from workflow.graph import EMPTY_QUERY_LABEL, ROUTE_TARGETS
 
     assert set(ROUTE_TARGETS) - {EMPTY_QUERY_LABEL} == set(CLASS_LABELS), (
         "路由表与分类标签集不一致：新增标签后必须同步 ROUTE_TARGETS"
@@ -19,13 +19,13 @@ def test_route_table_covers_every_classifier_label():
 
 def test_empty_query_label_is_not_a_classifier_label():
     """空查询是内部终态，不应混进分类器标签集。"""
-    from multi_agent_customer_service import EMPTY_QUERY_LABEL
+    from workflow.graph import EMPTY_QUERY_LABEL
 
     assert EMPTY_QUERY_LABEL not in CLASS_LABELS
 
 
 def test_graph_contains_entry_and_all_agent_nodes():
-    from multi_agent_customer_service import AGENT_NODES, make_graph
+    from workflow.graph import AGENT_NODES, make_graph
 
     ids = node_ids(make_graph())
     assert "classify_query" in ids, "图缺少分类入口节点"
@@ -35,6 +35,6 @@ def test_graph_contains_entry_and_all_agent_nodes():
 
 def test_graph_is_deterministic():
     """同样输入两次构建出的图结构应一致。"""
-    from multi_agent_customer_service import make_graph
+    from workflow.graph import make_graph
 
     assert node_ids(make_graph()) == node_ids(make_graph())

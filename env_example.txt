@@ -3,15 +3,15 @@
 
 # ===== LLM provider (any OpenAI-compatible endpoint) =====
 # These THREE must be self-consistent: the model name must exist on the chosen provider.
-# Example A - SiliconFlow:
+# Example A - DeepSeek (default):
+#   OPENAI_BASE_URL=https://api.deepseek.com
+#   OPENAI_MODEL=deepseek-chat
+# Example B - SiliconFlow:
 #   OPENAI_BASE_URL=https://api.siliconflow.cn/v1
 #   OPENAI_MODEL=Qwen/Qwen3-8B
-# Example B - DeepSeek:
-#   OPENAI_BASE_URL=https://api.deepseek.com
-#   OPENAI_MODEL=<your-provider's-model-id>
 OPENAI_API_KEY=your_api_key_here
-OPENAI_BASE_URL=https://api.siliconflow.cn/v1
-OPENAI_MODEL=Qwen/Qwen3-8B
+OPENAI_BASE_URL=https://api.deepseek.com
+OPENAI_MODEL=deepseek-chat
 
 # ===== HTTP client =====
 HTTP_TIMEOUT=30
@@ -35,10 +35,12 @@ WEB_PORT=5000
 # 2. Model choice
 # Verify the exact model id in your provider's docs BEFORE configuring.
 # A one-off real request is the cheapest way to confirm it.
+# DeepSeek:
+# - deepseek-chat (V3, fast, good for classification + expert replies)
+# - deepseek-reasoner (R1, deep reasoning; slower, overkill for this 2-call pipeline)
 # SiliconFlow examples:
 # - Qwen/QwQ-32B (strongest)
 # - Qwen/Qwen3-8B (good cost/performance)
-# - Qwen/Qwen3-14B (better quality)
 
 # 3. Optional overrides
 # To change timeout or retries, edit e.g.:

@@ -36,8 +36,7 @@ from multi_agents import (  # noqa: E402
     ProductAgent,
     TechAgent,
 )
-from tools import classify_query  # noqa: E402
-from tools.query_tools import CLASS_LABELS  # noqa: E402
+from workflow.classifier import CLASS_LABELS, classify_query  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +134,7 @@ def _bind_llm() -> None:
 
 # ---------------------------------------------------------------------------
 # 路由表：分类标签 → 图节点（路由的唯一事实来源）
-# 与 tools.query_tools._CLASS_LABELS 的一致性由 tests/test_routing.py 保证。
+# 与 workflow.classifier.CLASS_LABELS 的一致性由 tests/test_routing.py 保证。
 # ---------------------------------------------------------------------------
 
 ROUTE_TARGETS: Dict[str, Any] = {
@@ -289,6 +288,9 @@ def make_graph():
 
 
 if __name__ == "__main__":
+    # 注意：本文件移入 workflow/ 后，必须在项目根目录以模块方式运行：
+    #   python -m workflow.graph
+    # 直接 python workflow/graph.py 会导致 sys.path[0] 指向 workflow/，包内相对导入失败。
     logging.basicConfig(level=_config.LOG_CONFIG["level"], format=_config.LOG_CONFIG["format"])
     graph = make_graph()
     print("图结构自检：")
