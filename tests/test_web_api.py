@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-import chat_web_service as svc
-import web_app
+import webapp.service as svc
+import webapp.app as web_app
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -117,9 +117,9 @@ def test_health_and_index_page(client):
 def test_frontend_writes_back_thread_id():
     """
     回归：前端曾用本地伪 ID（'web_<时间戳>'）且从不回写服务端 thread_id，
-    导致后端无法识别会话。这里静态守住修复结果。
+    导致后端无法识别会话。这里静态守住修复结果（React 前端源码）。
     """
-    html = (PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    app_src = (PROJECT_ROOT / "frontend" / "src" / "App.jsx").read_text(encoding="utf-8")
 
-    assert "currentSessionId = data.thread_id" in html, "前端没有回写服务端 thread_id"
-    assert "'web_' + Date.now()" not in html, "前端又用回了本地伪会话 ID"
+    assert "setCurrentSessionId(data.thread_id)" in app_src, "前端没有回写服务端 thread_id"
+    assert "'web_' + Date.now()" not in app_src, "前端又用回了本地伪会话 ID"

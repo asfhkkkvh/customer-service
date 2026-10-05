@@ -1,0 +1,2 @@
+# 依赖不入库；dist/ 构建产物提交，克隆后无需 Node 环境即可直接启动 FastAPI 访问页面
+node_modules/

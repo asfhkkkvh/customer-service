@@ -6,9 +6,11 @@
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-%E2%89%A50.115-009688.svg" alt="FastAPI"></a>
   <a href="https://python.langchain.com/"><img src="https://img.shields.io/badge/langchain--core-%E2%89%A51.3-green.svg" alt="langchain-core"></a>
   <a href="https://github.com/langchain-ai/langgraph"><img src="https://img.shields.io/badge/LangGraph-%E2%89%A51.0-purple.svg" alt="LangGraph"></a>
+  <a href="https://react.dev/"><img src="https://img.shields.io/badge/React-18-61dafb.svg" alt="React 18"></a>
+  <a href="https://vitejs.dev/"><img src="https://img.shields.io/badge/Vite-5-646cff.svg" alt="Vite 5"></a>
 </p>
 
-<p align="center"><em>LLM 意图分类路由 · 5 个专家 Agent · 越界护栏 · FastAPI Web 前台 · LangGraph 会话编排</em></p>
+<p align="center"><em>LLM 意图分类路由 · 5 个专家 Agent · 越界护栏 · React + FastAPI Web 前台 · LangGraph 会话编排</em></p>
 
 ## 项目概述
 
@@ -56,7 +58,17 @@ customer-service-ai-agent/
 ├── data/knowledge/               # 领域知识数据（JSON）
 │   ├── product.json  tech.json  billing.json
 │   └── complaint.json  general.json
-├── templates/index.html          # 单页前端
+├── frontend/                     # React 前端（Vite 工程）
+│   ├── src/
+│   │   ├── App.jsx               # 顶层状态与布局（会话切换/发送/回写 thread_id）
+│   │   ├── api.js                # 后端 API 封装（统一错误抛出）
+│   │   ├── utils.js              # 时间格式化 + Markdown 安全渲染
+│   │   ├── styles.css            # 全局样式
+│   │   └── components/           # Sidebar / ChatArea / Message / DeleteModal
+│   ├── dist/                     # 构建产物（已提交，克隆即用，无需 Node）
+│   ├── index.html
+│   ├── vite.config.js            # dev 时代理 /api → 5000
+│   └── package.json
 ├── tests/                        # pytest（离线，打桩 requests 与 LLM）
 │   ├── conftest.py
 │   ├── test_classifier.py        # 标签归一化的脏输出用例
@@ -66,8 +78,10 @@ customer-service-ai-agent/
 │   ├── test_session_isolation.py # 会话隔离回归
 │   └── test_web_api.py           # Web API 契约
 ├── config.py                     # 集中配置
-├── chat_web_service.py           # LangGraph REST 调用与会话管理
-├── web_app.py                    # FastAPI 路由
+├── webapp/                       # Web 层
+│   ├── service.py                # LangGraph REST 调用与会话管理
+│   └── app.py                    # FastAPI 路由
+├── scripts/run.bat               # 一键启动脚本
 ├── langgraph.json                # LangGraph 平台部署配置
 ├── pytest.ini
 ├── requirements.txt
@@ -197,19 +211,28 @@ langgraph dev
 langgraph dev
 
 ## 终端2：启动自定义 Web 服务
-python ./web_app.py
+python -m webapp.app
 # 或使用 uvicorn 直启：
-# uvicorn web_app:app --host 0.0.0.0 --port 5000
+# uvicorn webapp.app:app --host 0.0.0.0 --port 5000
 ```
 
-浏览器访问 `http://localhost:5000`，界面功能：
+浏览器访问 `http://localhost:5000`（React 前端由 FastAPI 托管，`frontend/dist/` 构建产物已随仓库提交，**无需 Node 环境即可运行**），界面功能：
 
 - **实时聊天**：输入问题，获得智能回复
 - **智能体信息**：助手气泡内显示本轮的处理专家与查询类型
 - **会话管理**：侧栏查看历史会话、切换会话、清空当前会话
 - **数据导出**：`GET /api/sessions/{id}/export`（API 方式，返回 JSON 附件）
 
-也可直接运行 `run.bat` 一键拉起两个服务。
+也可直接运行 `scripts/run.bat` 一键拉起两个服务。
+
+**修改前端源码**（需要 Node 18+）：`frontend/` 是标准 Vite + React 工程。
+
+```bash
+cd frontend
+npm install
+npm run dev      # 开发模式：http://localhost:5173，热更新，/api 自动代理到 5000
+npm run build    # 重新构建产物到 dist/（构建后刷新 5000 即见新版）
+```
 
 ### 方式3：直接 API 调用
 
@@ -259,7 +282,7 @@ python ./web_app.py
 系统通过 OpenAI 兼容规范调用 LLM，可切换任意兼容服务商（硅基流动 / DeepSeek / 自建网关等），
 只需调整 `OPENAI_BASE_URL` 与 `OPENAI_MODEL`。
 
-`env_example.txt` 中给出了一组可选模型名作为示例；**实际可用名称以你的服务商文档为准**，
+`.env.example` 中给出了一组可选模型名作为示例；**实际可用名称以你的服务商文档为准**，
 配置前建议先用一次真实请求确认模型名有效。
 
 ## 扩展指南

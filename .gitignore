@@ -406,3 +406,8 @@ fictional-resume-photo.png
 # 本地测试与缓存
 .pytest_cache/
 tests/__pycache__/
+
+# ===== 本项目：前端构建产物入库（克隆即用，无需 Node 环境）=====
+# 上面的通用 dist/ 规则不适用于 frontend/dist/，这里显式排除例外
+!frontend/dist/
+!frontend/dist/**

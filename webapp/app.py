@@ -2,7 +2,7 @@
 """
 多智能体客服系统 - Web 入口（FastAPI）。
 
-只做路由与 HTTP 服务，业务逻辑见 chat_web_service.py。
+只做路由与 HTTP 服务，业务逻辑见 webapp/service.py。
 本层不依赖 LangChain / LangGraph，只通过 REST 与 LangGraph 服务通信。
 """
 
@@ -24,9 +24,10 @@ from fastapi.responses import (  # noqa: E402
     Response,
     StreamingResponse,
 )
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-from chat_web_service import (  # noqa: E402
+from .service import (  # noqa: E402
     clear_thread_and_create_new,
     create_thread,
     delete_remote_thread,
@@ -40,7 +41,11 @@ from config import LOG_CONFIG  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent  # 项目根（webapp/ 的上一级）
+
+# React（Vite）构建产物：dist 已随仓库提交，无 Node 环境也可直接启动。
+# 前端源码与构建方式见 frontend/ 目录。
+FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 
 app = FastAPI(title="多智能体客服系统", version="1.0.0")
 
@@ -68,8 +73,23 @@ class ChatRequest(BaseModel):
 
 @app.get("/")
 def index():
-    """主页（纯静态单页，无模板变量注入）"""
-    return FileResponse(BASE_DIR / "templates" / "index.html", media_type="text/html")
+    """主页：React 构建产物（未构建时返回操作指引）"""
+    index_html = FRONTEND_DIST / "index.html"
+    if not index_html.exists():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "前端尚未构建",
+                "hint": "在 frontend/ 目录执行 npm install && npm run build 后重启服务",
+            },
+        )
+    return FileResponse(index_html, media_type="text/html")
+
+
+# Vite 产物静态资源（带 hash 的 js/css）
+_assets_dir = FRONTEND_DIST / "assets"
+if _assets_dir.exists():
+    app.mount("/assets", StaticFiles(directory=_assets_dir), name="assets")
 
 
 # --- 聊天 ---
@@ -217,7 +237,7 @@ def main():
     print("🚀 多智能体客服系统 Web 应用 (FastAPI)")
     print("=" * 60)
     print(f"🌐 启动 Web 服务: http://localhost:{port}")
-    print("💡 按 Ctrl+C 停止服务（或另开终端用 `uvicorn web_app:app --port 5000` 直启）")
+    print("💡 按 Ctrl+C 停止服务（或另开终端用 `uvicorn webapp.app:app --port 5000` 直启）")
     print()
     import uvicorn
 
