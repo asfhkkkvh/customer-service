@@ -7,7 +7,7 @@
 
 from conftest import FakeResponse
 
-import chat_web_service as svc
+import webapp.service as svc
 
 
 class _FakeLangGraph:
