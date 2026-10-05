@@ -1,6 +1,5 @@
-"""pytest 公共夹具：路径注入、requests 假响应、可计数的假 LLM。"""
+"""pytest 公共夹具：路径注入与可计数的假 LLM。"""
 
-import json
 import sys
 from pathlib import Path
 
@@ -10,18 +9,6 @@ from langchain_core.messages import AIMessage
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-
-class FakeResponse:
-    """最小 requests.Response 替身。"""
-
-    def __init__(self, status_code=200, payload=None):
-        self.status_code = status_code
-        self._payload = {} if payload is None else payload
-        self.text = json.dumps(self._payload, ensure_ascii=False)
-
-    def json(self):
-        return self._payload
 
 
 class CountingLLM:

@@ -2,16 +2,16 @@ import { useEffect, useRef, useState } from 'react'
 import { formatSessionCreatedAt } from '../utils.js'
 
 /**
- * 会话侧栏：操作按钮 + 最近对话列表。
+ * 会话侧栏：操作按钮 + 会话列表。
+ * 列表数据来自前端 localStorage（见 conversations.js），不走后端接口。
  */
 export default function Sidebar({
-  sessions,
-  currentSessionId,
+  conversations,
+  currentId,
   onCreateNew,
-  onRefresh,
-  onLoadSession,
+  onSelect,
   onRequestDelete,
-  onApiTest,
+  onSelfCheck,
 }) {
   return (
     <div className="sidebar">
@@ -24,32 +24,25 @@ export default function Sidebar({
           </svg>
           <span>新建对话</span>
         </button>
-        <button type="button" className="session-btn session-btn-accent-sync" title="刷新列表" onClick={onRefresh}>
-          <svg className="btn-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
-            stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8M3 3v5h5M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16m0 5v-5h-5" />
-          </svg>
-          <span>刷新列表</span>
-        </button>
-        <button type="button" className="session-btn session-btn-accent-api" title="API测试" onClick={onApiTest}>
+        <button type="button" className="session-btn session-btn-accent-api" title="运行时自检" onClick={onSelfCheck}>
           <svg className="btn-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
             stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M16 18l6-6-6-6M8 6l-6 6 6 6M14 4l-4 16" />
           </svg>
-          <span>API测试</span>
+          <span>运行时自检</span>
         </button>
       </div>
       <div className="sidebar-title">最近对话</div>
       <div className="session-list">
-        {sessions.length === 0 ? (
+        {conversations.length === 0 ? (
           <div className="session-list-empty">暂无会话数据</div>
         ) : (
-          sessions.map((session) => (
-            <SessionItem
-              key={session.session_id}
-              session={session}
-              active={session.session_id === currentSessionId}
-              onLoad={onLoadSession}
+          conversations.map((conversation) => (
+            <ConversationItem
+              key={conversation.id}
+              conversation={conversation}
+              active={conversation.id === currentId}
+              onSelect={onSelect}
               onRequestDelete={onRequestDelete}
             />
           ))
@@ -59,7 +52,7 @@ export default function Sidebar({
   )
 }
 
-function SessionItem({ session, active, onLoad, onRequestDelete }) {
+function ConversationItem({ conversation, active, onSelect, onRequestDelete }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const rootRef = useRef(null)
 
@@ -80,10 +73,8 @@ function SessionItem({ session, active, onLoad, onRequestDelete }) {
     }
   }, [menuOpen])
 
-  const previewRaw = typeof session.last_user_question === 'string'
-    ? session.last_user_question.trim()
-    : ''
-  const titleText = previewRaw || '新对话'
+  const title = conversation.title || '新对话'
+  const count = conversation.messages ? conversation.messages.length : 0
 
   return (
     <div
@@ -94,10 +85,10 @@ function SessionItem({ session, active, onLoad, onRequestDelete }) {
         + (menuOpen ? ' session-item--menu-open' : '')
       }
     >
-      <div className="session-item-main" onClick={() => onLoad(session.session_id)}>
-        <div className="session-item-preview" title={previewRaw || undefined}>{titleText}</div>
+      <div className="session-item-main" onClick={() => onSelect(conversation.id)}>
+        <div className="session-item-preview" title={title}>{title}</div>
         <div className="session-item-meta">
-          消息: {session.message_count || 0} | 创建: {formatSessionCreatedAt(session.created_at)}
+          消息: {count} | 创建: {formatSessionCreatedAt(conversation.createdAt)}
         </div>
       </div>
       <div className="session-item-actions">
@@ -127,7 +118,7 @@ function SessionItem({ session, active, onLoad, onRequestDelete }) {
                   onClick={(e) => {
                     e.stopPropagation()
                     setMenuOpen(false)
-                    onRequestDelete({ sessionId: session.session_id, previewTitle: titleText })
+                    onRequestDelete({ id: conversation.id, title })
                   }}
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"

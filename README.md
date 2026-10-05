@@ -24,6 +24,11 @@
 分类器输出一个标签，图据此分发到**唯一**一个专家；标签无法归入客服业务范围时，
 护栏分支直接返回固定话术并结束，不进入任何业务 Agent。
 
+**运行方式**：图在 FastAPI 进程内直接执行（`graph.ainvoke`），不需要单独启动
+LangGraph Platform 服务；对话状态由进程内的 `AsyncSqliteSaver` 落盘到
+`data/checkpoints.db`，按 `thread_id` 隔离，重启进程后仍可续聊。
+启动一条命令即可：`python -m webapp.app`。
+
 ## 运行效果
 
 ### 首页
@@ -62,6 +67,7 @@ customer-service-ai-agent/
 │   ├── src/
 │   │   ├── App.jsx               # 顶层状态与布局（会话切换/发送/回写 thread_id）
 │   │   ├── api.js                # 后端 API 封装（统一错误抛出）
+│   │   ├── conversations.js      # 本地会话存储（localStorage）
 │   │   ├── utils.js              # 时间格式化 + Markdown 安全渲染
 │   │   ├── styles.css            # 全局样式
 │   │   └── components/           # Sidebar / ChatArea / Message / DeleteModal
@@ -69,7 +75,7 @@ customer-service-ai-agent/
 │   ├── index.html
 │   ├── vite.config.js            # dev 时代理 /api → 5000
 │   └── package.json
-├── tests/                        # pytest（离线，打桩 requests 与 LLM）
+├── tests/                        # pytest（离线，打桩 LLM，checkpoint 写临时目录）
 │   ├── conftest.py
 │   ├── test_classifier.py        # 标签归一化的脏输出用例
 │   ├── test_routing.py           # 路由表与标签集一致性
@@ -79,10 +85,10 @@ customer-service-ai-agent/
 │   └── test_web_api.py           # Web API 契约
 ├── config.py                     # 集中配置
 ├── webapp/                       # Web 层
-│   ├── service.py                # LangGraph REST 调用与会话管理
+│   ├── service.py                # 进程内运行时（图执行 / checkpoint / 会话管理）
 │   └── app.py                    # FastAPI 路由
 ├── scripts/run.bat               # 一键启动脚本
-├── langgraph.json                # LangGraph 平台部署配置
+├── langgraph.json                # 可选的 Studio 调试入口（不影响应用运行）
 ├── pytest.ini
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -132,13 +138,14 @@ class ProductAgent(BaseAgent):
 
 ### 5. 会话管理
 
-- **会话隔离**：线程 ID 全程作为请求参数传递，**不存在任何"当前线程"模块级全局状态**。
-  前端把服务端返回的 `thread_id` 回写并持续携带，因此不同浏览器/用户的会话互不干扰。
-  这条约定由 `tests/test_session_isolation.py` 守住。
+- **进程内持久化**：图由 `AsyncSqliteSaver` 提供 checkpointer，对话状态按 `thread_id`
+  落盘到 `data/checkpoints.db`；重启进程后回传同一个 `thread_id` 即可续聊。
+- **会话隔离**：`thread_id` 全程作为请求参数传递，**不存在任何"当前线程"模块级全局状态**。
+  会话 ID 由前端生成并作为 `thread_id` 传给后端，不同浏览器/用户的会话互不干扰。
+  这条约定由 `tests/test_session_isolation.py` 守住（含"两个线程上下文互不串线"的回归）。
+- **前端本地会话列表**：侧栏的会话列表与历史存在浏览器 localStorage（`cs_conversations`），
+  后端只提供 `DELETE /api/conversation/{thread_id}` 清理服务端 checkpoint。
 - **上下文感知**：每轮把最近 12 条对话按时间戳与角色拼进 prompt
-- **记忆功能**：对话按结构化轮次（`content` / `is_user` / `timestamp`）写入图状态，
-  由平台 checkpointer 持久化，跨进程可续聊
-- **数据导出**：`GET /api/sessions/{id}/export` 返回完整对话 JSON 附件
 
 ## 质量保障
 
@@ -147,7 +154,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-**64 项测试，全部离线运行**（`requests` 已打桩，LLM 用可计数的假实现替换），
+**62 项测试，全部离线运行**（LLM 用可计数的假实现替换，checkpoint 写入临时目录），
 不需要 API Key、不产生任何调用费用。覆盖：
 
 | 测试文件 | 守住什么 |
@@ -156,8 +163,8 @@ pytest
 | `test_routing.py` | 路由表与分类标签集**逐项一致**；图节点完整；图可重复构建 |
 | `test_graph_e2e.py` | 单轮恰好 2 次 LLM 调用；护栏短路；空查询 0 次调用；多轮轮次累加；第二轮 prompt 真的带上了第一轮 |
 | `test_agents.py` | 5 个 Agent 均挂载知识库；消息结构为「上下文 + 系统提示 + 查询」；召回精确且可复现；LLM 异常与未注入时返回兜底话术 |
-| `test_session_isolation.py` | 两个客户端**永不共用线程**；模块内不存在共享线程状态；回传 thread_id 可续聊 |
-| `test_web_api.py` | `/api/chat` 返回 `thread_id` / `agent` / `query_type`；错误状态码语义；导出附件；前端回写 thread_id 的静态检查 |
+| `test_session_isolation.py` | 两个线程**上下文互不串线**；未指定会话/`default` 各得到独立线程；回传 thread_id 可续聊；删除后 checkpoint 被清理；模块内不存在共享线程状态 |
+| `test_web_api.py` | `/api/chat` 返回 `thread_id` / `agent` / `query_type`；错误状态码语义；删除会话接口；已下线的 REST 会话端点返回 404；前端本地存储与 thread_id 传递的静态检查 |
 
 ## 安装和配置
 
@@ -165,12 +172,10 @@ pytest
 
 ```bash
 pip install -r requirements.txt
-pip install langgraph-cli
-pip install -U "langgraph-cli[inmem]"
 ```
 
-在 win 环境中，langgraph-cli 下载后需要将 `langgraph.exe` 路径加入 PATH 环境变量，
-或使用时直接带全路径，例 `<your site-packages>\bin\langgraph.exe`。
+无需安装 `langgraph-cli` / 启动 LangGraph Platform 服务——图在应用进程内运行，
+持久化由 `langgraph-checkpoint-sqlite` 完成。
 
 ### 2. 环境变量配置
 
@@ -195,35 +200,36 @@ python -m workflow.graph
 
 ## 🚀 运行说明
 
-### 方式1：使用 Studio UI 访问 LangGraph 服务
+一条命令即可启动（图在进程内执行，**不需要单独启动 LangGraph 服务**）：
 
 ```bash
-langgraph dev
-```
-
-启动后会自动拉起 LangSmith 服务，包含 LangStudio UI，默认 2024 端口。浏览器访问
-`https://smith.langchain.com/studio/thread?render=interact&baseUrl=http://127.0.0.1:2024`
-
-### 方式2：使用 Web 服务调用 LangGraph API
-
-```bash
-## 终端1：启动 LangGraph 服务
-langgraph dev
-
-## 终端2：启动自定义 Web 服务
 python -m webapp.app
 # 或使用 uvicorn 直启：
 # uvicorn webapp.app:app --host 0.0.0.0 --port 5000
 ```
 
+也可直接运行 `scripts/run.bat` 一键启动。
+
 浏览器访问 `http://localhost:5000`（React 前端由 FastAPI 托管，`frontend/dist/` 构建产物已随仓库提交，**无需 Node 环境即可运行**），界面功能：
 
 - **实时聊天**：输入问题，获得智能回复
 - **智能体信息**：助手气泡内显示本轮的处理专家与查询类型
-- **会话管理**：侧栏查看历史会话、切换会话、清空当前会话
-- **数据导出**：`GET /api/sessions/{id}/export`（API 方式，返回 JSON 附件）
+- **会话管理**：侧栏查看/切换/删除本地会话，删除时同步清理服务端 checkpoint
+- **运行时自检**：一键查看图节点、checkpointer 类型与已持久化线程数
 
-也可直接运行 `scripts/run.bat` 一键拉起两个服务。
+### 直接 API 调用
+
+接口文档在 `http://127.0.0.1:5000/docs`。主要端点：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/chat` | 发起一轮对话，返回 `thread_id` / `agent` / `query_type` |
+| `POST` | `/api/chat/stream` | 同上，SSE 流式返回 |
+| `DELETE` | `/api/conversation/{thread_id}` | 删除该会话的服务端 checkpoint |
+| `GET` | `/api/health` | 健康检查（含 `ready`） |
+| `GET` | `/api/test` | 运行时自检（节点、checkpointer、持久化线程数） |
+
+> 历史会话列表由前端从 localStorage 拼装，后端**不提供**"列出会话"的 REST 端点。
 
 **修改前端源码**（需要 Node 18+）：`frontend/` 是标准 Vite + React 工程。
 
@@ -234,16 +240,15 @@ npm run dev      # 开发模式：http://localhost:5173，热更新，/api 自�
 npm run build    # 重新构建产物到 dist/（构建后刷新 5000 即见新版）
 ```
 
-### 方式3：直接 API 调用
+### 可选的 Studio 调试
 
-接口文档默认在 `http://127.0.0.1:2024/docs`（内嵌 js，需要网络可达）。
-也可参考 `https://langchain-ai.github.io/langgraph/cloud/reference/api/api_ref.html`
-
-需要先 `langgraph dev` 启动 LangGraph 服务。
+如需用图形化界面调试图结构，可另起 `langgraph dev`（默认 2024 端口），它只读取
+`langgraph.json` 声明的入口，与应用进程相互独立，**不影响** `webapp` 的正常运行。
 
 ## 工作流程
 
-1. **会话解析**：校验前端传入的 thread_id 是否真实存在；无效则新建线程
+1. **会话解析**：前端生成并回传 `thread_id`，后端把它作为 LangGraph config 的
+   checkpointer 键；未传或传入 `default` 哨兵时新建线程
 2. **查询分类**：LLM 判定查询类型并归一化标签
 3. **护栏检查**：越界请求直接返回固定话术并结束
 4. **上下文加载**：从持久化轮次中取最近对话，拼进 prompt
@@ -257,7 +262,7 @@ npm run build    # 重新构建产物到 dist/（构建后刷新 5000 即见新�
 ```
 客户查询 → 会话解析 → 查询分类 → 护栏检查 → 上下文加载 → 智能体路由 → 专业处理 → 响应
     ↓         ↓          ↓           ↓           ↓           ↓          ↓
-  输入    线程校验    类型识别    越界拦截    历史加载    专家选择    专业解答
+  输入    确定线程    类型识别    越界拦截    历史加载    专家选择    专业解答
                                                  ↓
                                             状态持久化
 ```
@@ -299,17 +304,19 @@ npm run build    # 重新构建产物到 dist/（构建后刷新 5000 即见新�
 ### 修改工作流程
 
 图结构在 `workflow.graph.make_graph()` 里用代码显式声明。
-`langgraph.json` 只负责声明平台部署入口（哪个文件、哪个函数），不描述图结构。
+`langgraph.json` 只负责给可选的 Studio 调试声明入口（哪个文件、哪个函数），不描述图结构，
+也不参与应用的正常启动。
 
 ## 技术架构
 
-- **LangGraph**：工作流编排与平台化持久化
+- **LangGraph**：工作流编排 + 进程内 checkpoint 持久化（`AsyncSqliteSaver`）
 - **LangChain Core**：LLM 集成与消息处理
 - **OpenAI 兼容 API**：大语言模型服务
-- **FastAPI + Pydantic**：Web 层（零 LangChain 依赖，只通过 REST 与 LangGraph 通信）
+- **FastAPI + Pydantic**：Web 层（进程内直接执行图，无独立 LangGraph 服务）
+- **React 18 + Vite**：前端（会话列表存于浏览器 localStorage）
 - **模块化设计**：模板方法统一处理链路，数据与代码分离
 
 ## 相关文档
 
-- [langgraph.json](langgraph.json) - LangGraph 平台部署配置
+- [langgraph.json](langgraph.json) - 可选的 Studio 调试入口配置
 - [LangGraph CLI 配置](https://docs.langchain.com/langgraph-platform/cli#configuration-file)

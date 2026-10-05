@@ -10,8 +10,9 @@
                      ├─ general_inquiry ───→ general_agent ──→ END
                      └─ out_of_scope ──────→ END（护栏，不调用业务 Agent）
 
-`langgraph.json` 的作用是声明平台部署入口（本文件 + make_graph），
-图结构本身由代码定义。
+`make_graph(checkpointer)` 由应用进程直接调用并运行图（webapp/service.py），
+持久化由注入的 AsyncSqliteSaver 落盘；不传 checkpointer 时图不持久化（测试场景）。
+`langgraph.json` 仅保留用于可选的 LangGraph Studio 调试，不是运行本项目所必需。
 """
 
 from __future__ import annotations
@@ -260,8 +261,15 @@ def create_agent_node(agent_name: str):
 # ---------------------------------------------------------------------------
 
 
-def make_graph():
-    """构建 LangGraph 工作流图。"""
+def make_graph(checkpointer: Any = None):
+    """
+    构建 LangGraph 工作流图。
+
+    Args:
+        checkpointer: 持久化后端。应用内运行（webapp）时注入 AsyncSqliteSaver，
+            使多轮对话状态落盘到 data/checkpoints.db；不传则图不持久化
+            （测试与纯计算场景使用）。
+    """
     workflow = StateGraph(AgentState)
 
     workflow.add_node("classify_query", classify_query_node)
@@ -282,8 +290,8 @@ def make_graph():
     for node in AGENT_NODES:
         workflow.add_edge(node, END)
 
-    app = workflow.compile()
-    logger.info("LangGraph 工作流图构建完成")
+    app = workflow.compile(checkpointer=checkpointer)
+    logger.info("LangGraph 工作流图构建完成（checkpointer=%s）", type(checkpointer).__name__ if checkpointer else "无")
     return app
 
 
@@ -301,4 +309,4 @@ if __name__ == "__main__":
         "路由表与分类标签集不一致"
     )
     print("✅ 路由表与分类标签集一致")
-    print("🚀 多智能体客服系统准备就绪（依赖 langgraph dev 提供持久化）")
+    print("🚀 多智能体客服系统准备就绪（应用内运行，checkpoint 落盘 data/checkpoints.db）")

@@ -2,14 +2,14 @@
 """
 多智能体客服系统 - Web 入口（FastAPI）。
 
-只做路由与 HTTP 服务，业务逻辑见 webapp/service.py。
-本层不依赖 LangChain / LangGraph，只通过 REST 与 LangGraph 服务通信。
+图在应用进程内运行（见 webapp/service.py），不依赖 LangGraph Platform 服务。
+本层只做路由与 HTTP 服务。
 """
 
-import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -18,25 +18,11 @@ load_dotenv()
 
 from fastapi import FastAPI  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import (  # noqa: E402
-    FileResponse,
-    JSONResponse,
-    Response,
-    StreamingResponse,
-)
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-from .service import (  # noqa: E402
-    clear_thread_and_create_new,
-    create_thread,
-    delete_remote_thread,
-    fetch_session_detail,
-    fetch_sessions_list,
-    langgraph_connectivity_test,
-    run_chat_sync,
-    stream_chat_events,
-)
+from . import service  # noqa: E402
 from config import LOG_CONFIG  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -47,7 +33,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # 项目根（webapp/ 的上�
 # 前端源码与构建方式见 frontend/ 目录。
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 
-app = FastAPI(title="多智能体客服系统", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """启动时构建图与 checkpointer，关闭时释放 SQLite 连接。"""
+    await service.startup()
+    try:
+        yield
+    finally:
+        await service.shutdown()
+
+
+app = FastAPI(title="多智能体客服系统", version="2.0.0", lifespan=lifespan)
 
 # CORS：同源渲染本不需要，放开以兼容 file:// 直接打开或后续跨端口部署。
 # 可通过 WEB_CORS_ORIGINS 收紧（逗号分隔）。
@@ -96,14 +93,14 @@ if _assets_dir.exists():
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest):
+async def chat(req: ChatRequest):
     """
-    处理聊天请求（阻塞等待 LangGraph 运行完成）。
+    处理一轮聊天（在图执行完成后返回）。
 
-    响应中的 thread_id 是服务端真实线程 ID，前端**必须**保存并在后续请求中回传，
-    否则每轮都会新建线程、无法续聊。
+    响应中的 thread_id 是服务端线程 ID：首次对话由服务端生成，前端**必须**保存并在
+    后续请求中回传，否则每轮都会落成新会话、无法续聊。
     """
-    result = run_chat_sync(req.message, req.session_id)
+    result = await service.run_chat(req.message, req.session_id)
 
     if not result.ok:
         # 空消息属客户端错误，原样透传其状态码
@@ -120,15 +117,15 @@ def chat(req: ChatRequest):
 
 
 @app.post("/api/chat/stream")
-def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest):
     """
     SSE 聊天端点。
 
-    注意：当前实现为"轮询完成后一次性返回"，不是 token 级流式；
+    注意：当前实现为"运行完成后一次性返回"，不是 token 级流式；
     前端默认走阻塞式 /api/chat，此端点保留给需要 SSE 形状的调用方。
     """
     return StreamingResponse(
-        stream_chat_events(req.message, req.session_id),
+        service.stream_chat_events(req.message, req.session_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -137,79 +134,17 @@ def chat_stream(req: ChatRequest):
 # --- 会话管理 ---
 
 
-@app.get("/api/sessions")
-def get_sessions():
-    """获取会话列表"""
-    sessions, err = fetch_sessions_list()
-    if err:
-        return JSONResponse(status_code=502, content={"error": err})
-    return {"sessions": sessions or []}
+@app.delete("/api/conversation/{thread_id}")
+async def delete_conversation(thread_id: str):
+    """
+    删除会话：清掉该线程的 checkpoint。
 
-
-@app.get("/api/sessions/{session_id}")
-def get_session(session_id: str):
-    """获取特定会话详情"""
-    session_data, err = fetch_session_detail(session_id)
-    if err:
-        return JSONResponse(status_code=502, content={"error": err})
-    return {"session": session_data}
-
-
-@app.delete("/api/sessions/{session_id}")
-def delete_session(session_id: str):
-    """删除会话"""
-    ok, status = delete_remote_thread(session_id)
+    会话列表由前端 localStorage 维护，后端只负责删服务端状态。
+    """
+    ok, err = await service.delete_conversation(thread_id)
     if ok:
         return {"message": "会话删除成功"}
-    return JSONResponse(status_code=502, content={"error": f"删除会话失败: HTTP {status}"})
-
-
-@app.post("/api/sessions/{session_id}/clear")
-def clear_session(session_id: str):
-    """清空会话（删除旧线程并新建一条）"""
-    new_thread_id, err = clear_thread_and_create_new(session_id)
-    if err:
-        return JSONResponse(status_code=502, content={"error": err})
-    return {"message": "会话清空成功", "new_thread_id": new_thread_id}
-
-
-@app.get("/api/sessions/{session_id}/export")
-def export_session(session_id: str):
-    """
-    导出单个会话的完整对话记录（JSON 下载），用于离线分析。
-
-    以附件形式返回，浏览器会直接下载成 session-<id>.json。
-    """
-    session_data, err = fetch_session_detail(session_id)
-    if err:
-        return JSONResponse(status_code=502, content={"error": err})
-
-    history = session_data.get("conversation_history") or []
-    payload = {
-        "session_id": session_id,
-        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "message_count": len(history),
-        "conversation_history": history,
-    }
-    return Response(
-        content=json.dumps(payload, ensure_ascii=False, indent=2),
-        media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="session-{session_id}.json"'},
-    )
-
-
-@app.post("/api/new_session")
-def create_new_session():
-    """
-    创建新会话：由服务端真实创建 LangGraph 线程并返回其 ID。
-
-    不再返回本地伪 ID —— 伪 ID 会在后端校验失败后触发"回落"行为，
-    导致不同用户共用线程。
-    """
-    thread_id, err = create_thread()
-    if err:
-        return JSONResponse(status_code=502, content={"error": err})
-    return {"session_id": thread_id, "thread_id": thread_id, "message": "新会话创建成功"}
+    return JSONResponse(status_code=502, content={"error": err})
 
 
 # --- 健康与诊断 ---
@@ -218,23 +153,20 @@ def create_new_session():
 @app.get("/api/health")
 def health_check():
     """健康检查"""
-    return {"status": "healthy", "timestamp": time.time()}
+    return {"status": "healthy", "timestamp": time.time(), "ready": service.is_ready()}
 
 
 @app.get("/api/test")
-def test_langgraph():
-    """测试 LangGraph API 调用"""
-    result, err = langgraph_connectivity_test()
-    if err:
-        return JSONResponse(status_code=502, content={"error": err})
-    return result
+async def test_runtime():
+    """图与持久化自检（节点清单、checkpointer、落盘位置、会话数）"""
+    return await service.graph_info()
 
 
 def main():
     """主函数"""
     logging.basicConfig(level=LOG_CONFIG["level"], format=LOG_CONFIG["format"])
     port = int(os.getenv("WEB_PORT", "5000"))
-    print("🚀 多智能体客服系统 Web 应用 (FastAPI)")
+    print("🚀 多智能体客服系统 Web 应用 (FastAPI，进程内运行 LangGraph)")
     print("=" * 60)
     print(f"🌐 启动 Web 服务: http://localhost:{port}")
     print("💡 按 Ctrl+C 停止服务（或另开终端用 `uvicorn webapp.app:app --port 5000` 直启）")

@@ -411,3 +411,8 @@ tests/__pycache__/
 # 上面的通用 dist/ 规则不适用于 frontend/dist/，这里显式排除例外
 !frontend/dist/
 !frontend/dist/**
+
+# ===== 本项目：LangGraph checkpoint 数据库（本地运行时状态，不入库）=====
+data/checkpoints.db
+data/checkpoints.db-shm
+data/checkpoints.db-wal

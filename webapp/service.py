@@ -1,45 +1,42 @@
 #!/usr/bin/env python3
 """
-客服 Web 业务逻辑层：LangGraph REST 调用与线程/会话管理。
+客服业务逻辑层（进程内运行时）。
 
-与 Web 路由解耦，便于单测与复用。
+不使用 LangGraph Platform 的 REST API：本模块在应用进程内持有**一个已编译的
+LangGraph 图**，通过 `graph.ainvoke` 直接执行，无需 langgraph_sdk、/threads、
+/runs、/state 等服务端端点，也没有 run 轮询。
 
-**会话隔离约定**：本模块不保存任何"当前线程"的模块级状态。
-线程 ID 由调用方传入、由本模块返回，全程作为局部变量与返回值传递，
-因此多个请求（乃至多个用户）并发时互不干扰。
-（唯一例外：助手 ID 是 LangGraph 的不可变标识，缓存它是安全的。）
+持久化由 `AsyncSqliteSaver` 负责，checkpoint 落盘到 `data/checkpoints.db`：
+多轮对话状态（含 `persisted_dialogue`）按 thread_id 隔离并跨进程可续聊。
+
+**会话隔离约定**：thread_id 由调用方传入，作为 LangGraph config 的
+`configurable.thread_id`；本模块只持有「图 / checkpointer」这类应用级基础设施，
+不保存任何"当前线程"的请求级状态，因此多用户并发互不干扰。
 """
 
 from __future__ import annotations
 
-import datetime as _dt
-import json
 import logging
 import os
-import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
-import requests
+import aiosqlite
 from dotenv import load_dotenv
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# 配置（可被环境变量覆盖）
-# -----------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-LANGGRAPH_API_URL: str = os.getenv("LANGGRAPH_API_URL", "http://127.0.0.1:2024").rstrip("/")
-LANGGRAPH_GRAPH_NAME: str = os.getenv("LANGGRAPH_GRAPH_NAME", "customer_service")
-
-#: 单轮对话最长等待时间（秒）
-RUN_TIMEOUT_SECONDS = int(os.getenv("RUN_TIMEOUT_SECONDS", "120"))
-
-
-def _url(path: str) -> str:
-    return f"{LANGGRAPH_API_URL}{path}"
+#: checkpoint 落盘位置（可用 CHECKPOINT_DB_PATH 覆盖）
+CHECKPOINT_DB_PATH: Path = Path(
+    os.getenv("CHECKPOINT_DB_PATH") or (BASE_DIR / "data" / "checkpoints.db")
+)
 
 
 @dataclass
@@ -59,408 +56,123 @@ class ChatOutcome:
 
 
 # -----------------------------------------------------------------------------
-# 线程 state → 对话列表 / 元信息
+# 应用级运行时（图 + checkpointer 单例，非请求级状态）
+# -----------------------------------------------------------------------------
+
+_conn: Optional[aiosqlite.Connection] = None
+_saver: Optional[AsyncSqliteSaver] = None
+_graph: Any = None
+
+
+async def startup() -> None:
+    """应用启动：打开 SQLite、建表、构建带 checkpointer 的图。"""
+    global _conn, _saver, _graph
+
+    # 延迟导入：避免 webapp 导入期就拉起 LangChain/LangGraph 依赖
+    from workflow.graph import make_graph
+
+    CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _conn = await aiosqlite.connect(str(CHECKPOINT_DB_PATH))
+    _saver = AsyncSqliteSaver(_conn)
+    await _saver.setup()
+    _graph = make_graph(_saver)
+    logger.info("运行时就绪：checkpoint → %s", CHECKPOINT_DB_PATH)
+
+
+async def shutdown() -> None:
+    """应用关闭：释放 SQLite 连接。"""
+    global _conn, _saver, _graph
+    if _conn is not None:
+        await _conn.close()
+    _conn = _saver = _graph = None
+
+
+def is_ready() -> bool:
+    return _graph is not None
+
+
+def new_thread_id() -> str:
+    """生成一个新的会话（线程）ID。"""
+    return str(uuid.uuid4())
+
+
+def _require_graph() -> Any:
+    if _graph is None:
+        raise RuntimeError("图尚未初始化：应用 startup 未完成")
+    return _graph
+
+
+# -----------------------------------------------------------------------------
+# 状态解析
 # -----------------------------------------------------------------------------
 
 
-def _state_values(state_data: Any) -> Dict[str, Any]:
-    """线程 state 可能是 {values: {...}} 包装，也可能直接就是状态字典，统一取值区。"""
-    if not isinstance(state_data, dict):
-        return {}
-    values = state_data.get("values")
-    return values if isinstance(values, dict) else state_data
-
-
-def _turn_list(values: Dict[str, Any]) -> Optional[List[Any]]:
-    """优先取结构化轮次（persisted_dialogue / conversation_history），无则 None。"""
-    for key in ("persisted_dialogue", "conversation_history"):
-        turns = values.get(key)
-        if isinstance(turns, list) and turns:
-            return turns
-    return None
-
-
-def conversation_history_from_state_data(state_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    从 LangGraph 线程 state JSON 解析对话列表。
-
-    数据源优先级：结构化轮次（persisted_dialogue / conversation_history）
-    > 原生 messages > values.response（兜底一条助手消息）。
-    已有轮次时不再追加 response —— 助手正文已在轮次里，
-    重复追加会造成「两条回复」的观感。
-    """
-    values = _state_values(state_data)
-    turns = _turn_list(values)
-
-    history: List[Dict[str, Any]] = []
-    for item in (turns if turns is not None else (values.get("messages") or [])):
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content", "") or ""
-        if not content:
-            continue
-        # 轮次用 is_user 标记，原生 messages 用 role 标记，两者归一
-        is_user = bool(item.get("is_user", item.get("role") == "user"))
-        entry: Dict[str, Any] = {
-            "is_user": is_user,
-            "content": content,
-            "role": "user" if is_user else "assistant",
-        }
-        ts = item.get("timestamp")
-        if ts is not None and ts != "":
-            entry["timestamp"] = ts
-        history.append(entry)
-
-    if turns is None:
-        response = values.get("response")
-        if response and not any(m["content"] == response and not m["is_user"] for m in history):
-            history.append({"is_user": False, "content": response, "role": "assistant"})
-
-    return history
-
-
-def last_user_question_from_history(conversation_history: List[Dict[str, Any]]) -> str:
-    """取最后一条用户消息的纯文本（用于侧栏预览）。"""
-    for msg in reversed(conversation_history):
-        if not msg.get("is_user"):
-            continue
-        content = msg.get("content", "")
-        if not isinstance(content, str):
-            content = str(content) if content is not None else ""
-        if content.strip():
-            return content.strip()
-    return ""
-
-
-def extract_ai_response(thread_state: Dict[str, Any]) -> str:
-    """从线程状态中提取 AI 回复文本。"""
-    values = _state_values(thread_state)
-    if values.get("response"):
-        return str(values["response"])
-    for message in values.get("messages") or []:
-        if isinstance(message, dict) and message.get("role") == "assistant" and message.get("content"):
-            return str(message["content"])
+def extract_ai_response(state: Dict[str, Any]) -> str:
+    """从图返回的最终状态中提取 AI 回复文本。"""
+    if isinstance(state, dict) and state.get("response"):
+        return str(state["response"])
     return "抱歉，我无法理解您的问题。"
 
 
-def extract_response_meta(thread_state: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """从线程状态中提取处理专家与查询类型（供前端展示徽章）。"""
-    values = _state_values(thread_state)
+def extract_response_meta(state: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """提取处理专家与查询类型（供前端展示徽章）。"""
+    values = state if isinstance(state, dict) else {}
     return {"agent": values.get("current_agent"), "query_type": values.get("query_type")}
 
 
 # -----------------------------------------------------------------------------
-# 助手 / 线程
+# 对话运行
 # -----------------------------------------------------------------------------
 
 
-#: 助手 ID 是 LangGraph 的**不可变标识**，缓存它是安全的。
-#: 注意与线程 ID 的区别：线程 ID 每个会话都不同，绝不能放进模块级缓存。
-_assistant_id: Optional[str] = None
-
-
-def ensure_assistant_exists() -> Tuple[Optional[str], Optional[str]]:
-    """确保 LangGraph 助手存在（搜不到就建一个）。成功返回 (assistant_id, None)。"""
-    global _assistant_id
-    if _assistant_id:
-        return _assistant_id, None
-
-    try:
-        response = requests.post(
-            _url("/assistants/search"),
-            json={"graph_id": LANGGRAPH_GRAPH_NAME, "limit": 1},
-            timeout=10,
-        )
-        if response.status_code == 200 and response.json():
-            _assistant_id = response.json()[0]["assistant_id"]
-            logger.info("找到现有助手: %s", _assistant_id)
-            return _assistant_id, None
-
-        response = requests.post(
-            _url("/assistants"),
-            json={
-                "graph_id": LANGGRAPH_GRAPH_NAME,
-                "name": "Customer Service Assistant",
-                "description": "Multi-agent customer service system",
-            },
-            timeout=10,
-        )
-        if response.status_code != 200:
-            logger.error("创建助手失败: HTTP %s", response.status_code)
-            return None, f"创建助手失败: HTTP {response.status_code}"
-
-        _assistant_id = response.json()["assistant_id"]
-        logger.info("创建新助手: %s", _assistant_id)
-        return _assistant_id, None
-
-    except Exception as e:
-        logger.error("确保助手存在时出错: %s", e)
-        return None, f"连接 LangGraph 服务失败: {e}"
-
-
-def create_thread() -> Tuple[Optional[str], Optional[str]]:
-    """新建一条 LangGraph 线程。成功返回 (thread_id, None)。"""
-    try:
-        response = requests.post(_url("/threads"), json={}, timeout=10)
-    except requests.RequestException as e:
-        logger.error("创建线程请求失败: %s", e)
-        return None, f"创建线程失败: {e}"
-
-    if response.status_code != 200:
-        logger.error("创建线程失败: HTTP %s", response.status_code)
-        return None, f"创建线程失败: HTTP {response.status_code}"
-
-    thread_id = (response.json() or {}).get("thread_id")
-    if not thread_id:
-        return None, "创建线程失败: 响应缺少 thread_id"
-
-    logger.info("创建新线程: %s", thread_id)
-    return thread_id, None
-
-
-def thread_exists(thread_id: str) -> bool:
-    """校验线程是否真实存在。"""
-    try:
-        return requests.get(_url(f"/threads/{thread_id}"), timeout=5).status_code == 200
-    except requests.RequestException as e:
-        logger.warning("校验线程 %s 时出错: %s", thread_id, e)
-        return False
-
-
-def resolve_thread(client_session_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+async def run_chat(user_message: str, thread_id: Optional[str] = None) -> ChatOutcome:
     """
-    解析出本轮请求应使用的线程 ID。
+    执行一轮对话。
 
-    - 传入真实存在的线程 ID → 复用，实现多轮续聊
-    - 传入无效 ID（例如前端本地生成的 `web_<时间戳>`）→ **新建线程**，
-      绝不回落到其他请求使用过的线程
-    - 未传入 / 'default' 哨兵 → 新建线程
-    """
-    sid = (client_session_id or "").strip()
-    if sid and sid != "default":
-        if thread_exists(sid):
-            return sid, None
-        logger.info("会话 ID %s 不是有效的 LangGraph 线程，为其新建线程", sid)
-    return create_thread()
-
-
-def clear_thread_and_create_new(thread_id: str) -> Tuple[Optional[str], Optional[str]]:
-    """删除旧线程并新建一条替代线程。成功返回 (new_thread_id, None)。"""
-    ok, status = delete_remote_thread(thread_id)
-    if not ok:
-        return None, f"清空会话失败: HTTP {status}"
-    return create_thread()
-
-
-def delete_remote_thread(thread_id: str) -> Tuple[bool, int]:
-    """删除 LangGraph 线程。成功为任意 2xx（DELETE 常为 204 No Content）。"""
-    try:
-        response = requests.delete(_url(f"/threads/{thread_id}"), timeout=10)
-    except requests.RequestException as e:
-        logger.error("删除线程失败: %s", e)
-        return False, 0
-    return 200 <= response.status_code < 300, response.status_code
-
-
-# -----------------------------------------------------------------------------
-# 会话列表 / 详情
-# -----------------------------------------------------------------------------
-
-
-def _normalize_created_at(created_at: Any) -> float:
-    """线程 created_at 兼容 ISO 字符串 / Unix 秒 / 异常值，统一为 Unix 秒。"""
-    if isinstance(created_at, str):
-        try:
-            return _dt.datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
-        except Exception:
-            return time.time()
-    if isinstance(created_at, (int, float)) and created_at > 0:
-        return float(created_at)
-    return time.time()
-
-
-def _thread_state(thread_id: str) -> Dict[str, Any]:
-    """拉取单个线程的 state，失败返回空字典（列表展示容错，不中断整体）。"""
-    try:
-        response = requests.get(_url(f"/threads/{thread_id}/state"), timeout=5)
-        if response.status_code == 200:
-            return response.json()
-        logger.warning("获取线程 %s 状态失败: HTTP %s", thread_id, response.status_code)
-    except requests.RequestException as e:
-        logger.warning("获取线程 %s 状态时出错: %s", thread_id, e)
-    return {}
-
-
-def fetch_sessions_list(limit: int = 50) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-    """
-    拉取线程列表并拼装前端会话项（标题 / 消息数 / 创建时间）。
-    LangGraph 没有批量取 state 的接口，逐线程各取一次。
-    """
-    try:
-        response = requests.post(_url("/threads/search"), json={"limit": limit}, timeout=10)
-        if response.status_code != 200:
-            logger.error("获取线程列表失败: HTTP %s", response.status_code)
-            return None, f"获取会话列表失败: HTTP {response.status_code}"
-
-        sessions: List[Dict[str, Any]] = []
-        for thread in response.json():
-            thread_id = thread.get("thread_id", "")
-            history = conversation_history_from_state_data(_thread_state(thread_id))
-            sessions.append({
-                "session_id": thread_id,
-                "created_at": _normalize_created_at(thread.get("created_at", time.time())),
-                "message_count": len(history),
-                "last_user_question": last_user_question_from_history(history),
-            })
-
-        return sessions, None
-
-    except Exception as e:
-        logger.exception("获取会话列表时出错")
-        return None, f"服务器错误: {e}"
-
-
-def fetch_session_detail(session_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """获取单个线程详情 + 对话历史。成功返回 (payload, None)。"""
-    try:
-        response = requests.get(_url(f"/threads/{session_id}"), timeout=10)
-        if response.status_code != 200:
-            logger.error("获取线程详情失败: HTTP %s", response.status_code)
-            return None, f"获取会话详情失败: HTTP {response.status_code}"
-
-        return {
-            "session_id": session_id,
-            "created_at": response.json().get("created_at", time.time()),
-            "conversation_history": conversation_history_from_state_data(_thread_state(session_id)),
-        }, None
-
-    except Exception as e:
-        logger.exception("获取会话详情时出错")
-        return None, f"服务器错误: {e}"
-
-
-# -----------------------------------------------------------------------------
-# 一次聊天运行
-# -----------------------------------------------------------------------------
-
-
-def _submit_run(thread_id: str, assistant_id: str, user_message: str) -> Tuple[Optional[str], Optional[str]]:
-    """向线程提交一轮用户消息，返回 (run_id, error)。"""
-    payload = {
-        "assistant_id": assistant_id,
-        "input": {
-            "messages": [{"role": "user", "content": user_message}],
-            "customer_query": user_message,
-            "session_id": thread_id,
-        },
-    }
-    try:
-        run_resp = requests.post(_url(f"/threads/{thread_id}/runs"), json=payload, timeout=30)
-    except requests.RequestException as e:
-        logger.error("提交运行失败: %s", e)
-        return None, f"调用失败: {e}"
-
-    if run_resp.status_code != 200:
-        logger.error("创建运行失败: HTTP %s", run_resp.status_code)
-        return None, f"调用失败: HTTP {run_resp.status_code}"
-
-    run_id = (run_resp.json() or {}).get("run_id")
-    if not run_id:
-        return None, "调用失败: 响应缺少 run_id"
-    return run_id, None
-
-
-def _wait_for_run(thread_id: str, run_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """轮询运行状态直到结束（指数退避，超时上限 RUN_TIMEOUT_SECONDS）。成功返回 (thread_state, None)。"""
-    started = time.time()
-    attempt = 0
-
-    while True:
-        if time.time() - started > RUN_TIMEOUT_SECONDS:
-            logger.warning("运行超时，已等待 %s 秒", RUN_TIMEOUT_SECONDS)
-            return None, "运行超时，请稍后重试"
-
-        # 退避：前几轮快、之后放慢，兼顾响应延迟与请求量
-        time.sleep(min(0.4 * (1.5 ** attempt), 2.0))
-        attempt += 1
-
-        try:
-            status_response = requests.get(_url(f"/threads/{thread_id}/runs/{run_id}"), timeout=10)
-        except requests.RequestException as e:
-            logger.error("获取运行状态失败: %s", e)
-            return None, f"获取运行状态失败: {e}"
-
-        if status_response.status_code != 200:
-            logger.error("获取运行状态失败: HTTP %s", status_response.status_code)
-            return None, f"获取运行状态失败: HTTP {status_response.status_code}"
-
-        status = (status_response.json() or {}).get("status", "unknown")
-        if status in ("completed", "success"):
-            state_response = requests.get(_url(f"/threads/{thread_id}/state"), timeout=10)
-            if state_response.status_code != 200:
-                return None, "无法获取线程状态"
-            return state_response.json(), None
-        if status in ("failed", "cancelled", "error", "timeout"):
-            logger.error("运行失败: %s", status)
-            return None, f"运行失败: {status}"
-
-
-def run_chat_sync(user_message: str, client_session_id: Optional[str] = None) -> ChatOutcome:
-    """
-    在当前线程上提交一轮用户消息并等待完成。
-
-    返回的 ChatOutcome 一定带回 `thread_id`；调用方应把它持久化并在后续请求中回传，
-    这样才能实现多轮续聊。
+    thread_id 为空时自动生成一个；调用方应把它持久化并在后续请求中回传，
+    这样才能在同一线程上续聊（否则每轮都是全新会话）。
     """
     message = (user_message or "").strip()
     if not message:
         return ChatOutcome(error="消息不能为空", http_status=400)
 
-    assistant_id, err = ensure_assistant_exists()
-    if err:
-        return ChatOutcome(error=err, http_status=500)
-
-    thread_id, err = resolve_thread(client_session_id)
-    if err:
-        return ChatOutcome(error=err, http_status=500)
+    tid = (thread_id or "").strip()
+    # 'default' 是前端"尚未建立会话"的哨兵值，不能当作真实线程 ID，
+    # 否则所有未携带 session_id 的请求会共用同一条线程。
+    if not tid or tid == "default":
+        tid = new_thread_id()
 
     try:
-        run_id, err = _submit_run(thread_id, assistant_id, message)
-        if err:
-            return ChatOutcome(error=err, http_status=500, thread_id=thread_id)
-
-        thread_state, err = _wait_for_run(thread_id, run_id)
-        if err:
-            return ChatOutcome(error=err, http_status=500, thread_id=thread_id)
-
-        meta = extract_response_meta(thread_state)
-        return ChatOutcome(
-            text=extract_ai_response(thread_state),
-            thread_id=thread_id,
-            agent=meta["agent"],
-            query_type=meta["query_type"],
+        graph = _require_graph()
+        state = await graph.ainvoke(
+            {"customer_query": message, "session_id": tid},
+            config={"configurable": {"thread_id": tid}},
         )
-
     except Exception as e:
-        logger.exception("聊天处理错误")
-        return ChatOutcome(error=f"内部错误: {e}", http_status=500, thread_id=thread_id)
+        logger.exception("对话执行失败")
+        return ChatOutcome(error=f"内部错误: {e}", http_status=500, thread_id=tid)
+
+    return ChatOutcome(
+        text=extract_ai_response(state),
+        thread_id=tid,
+        agent=state.get("current_agent") if isinstance(state, dict) else None,
+        query_type=state.get("query_type") if isinstance(state, dict) else None,
+    )
 
 
-def stream_chat_events(user_message: str, client_session_id: Optional[str] = None) -> Iterable[str]:
+async def stream_chat_events(
+    user_message: str, thread_id: Optional[str] = None
+) -> AsyncIterator[str]:
     """
-    生成 SSE data 行（含末尾 [DONE]）。复用 run_chat_sync 的执行链路。
+    生成 SSE data 行（含末尾 [DONE]）。
 
-    ⚠️ 这不是 token 级流式：运行完成后一次性写出整段回复，
-    只是把等待过程包装成 SSE 形状。若要真正的逐 token 输出，应改用 LangGraph 的
-    `POST /threads/{tid}/runs/stream` 并以 stream=True 透传事件。
+    ⚠️ 当前为「运行完成后一次性写出」，不是 token / 节点级流式。
+    如需逐节点推送，把 run_chat 换成 `graph.astream(input, config, stream_mode="updates")`
+    并在循环里 yield 每个节点事件即可。
     """
-
-    def sse(payload: Dict[str, Any]) -> str:
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    outcome = run_chat_sync(user_message, client_session_id)
+    outcome = await run_chat(user_message, thread_id)
     if outcome.ok:
-        yield sse({
+        yield _sse({
             "content": outcome.text,
             "session_id": outcome.thread_id,
             "thread_id": outcome.thread_id,
@@ -468,38 +180,66 @@ def stream_chat_events(user_message: str, client_session_id: Optional[str] = Non
             "query_type": outcome.query_type,
         })
     else:
-        yield sse({"error": outcome.error})
+        yield _sse({"error": outcome.error})
     yield "data: [DONE]\n\n"
 
 
-def langgraph_connectivity_test() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """探测 LangGraph 服务与搜索接口。成功返回 (result, None)。"""
+def _sse(payload: Dict[str, Any]) -> str:
+    import json
+
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+# -----------------------------------------------------------------------------
+# 会话管理
+# -----------------------------------------------------------------------------
+
+
+async def delete_conversation(thread_id: str) -> Tuple[bool, Optional[str]]:
+    """删除一个会话的全部 checkpoint（图状态）。成功返回 (True, None)。"""
+    tid = (thread_id or "").strip()
+    if not tid:
+        return False, "会话 ID 不能为空"
+    if _saver is None:
+        return False, "服务未就绪"
+
     try:
-        try:
-            health_check_status = requests.get(_url("/ok"), timeout=5).status_code
-        except requests.RequestException as e:
-            logger.warning("LangGraph GET /ok 失败: %s", e)
-            health_check_status = 0
-
-        threads_response = requests.post(_url("/threads/search"), json={}, timeout=10)
-        assistants_response = requests.post(_url("/assistants/search"), json={}, timeout=10)
-
-        if not (200 <= health_check_status < 300) and 200 <= threads_response.status_code < 300:
-            logger.warning("GET /ok 未成功，但 threads/search 正常，健康检查标记为通过")
-            health_check_status = 200
-
-        return {
-            "status": "test_completed",
-            "health_check": health_check_status,
-            "threads_search": threads_response.status_code,
-            "assistants_search": assistants_response.status_code,
-            "details": {
-                "ok_response": "OK" if 200 <= health_check_status < 300 else (health_check_status or "unreachable"),
-                "threads_response": threads_response.text if threads_response.status_code != 200 else "OK",
-                "assistants_response": assistants_response.text if assistants_response.status_code != 200 else "OK",
-            },
-        }, None
-
+        await _saver.adelete_thread(tid)
     except Exception as e:
-        logger.exception("测试 LangGraph API 时出错")
-        return None, f"测试失败: {e}"
+        logger.exception("删除会话失败")
+        return False, f"删除会话失败: {e}"
+    return True, None
+
+
+async def persisted_thread_count() -> int:
+    """已持久化的会话数（诊断用）。"""
+    if _conn is None:
+        return 0
+    try:
+        async with _conn.execute("SELECT COUNT(DISTINCT thread_id) FROM checkpoints") as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+    except Exception as e:
+        logger.warning("统计会话数失败: %s", e)
+        return 0
+
+
+async def graph_info() -> Dict[str, Any]:
+    """图与持久化的自检信息（供 /api/test 展示）。"""
+    if _graph is None:
+        return {"status": "not_ready", "checkpointer": None, "checkpoint_db": str(CHECKPOINT_DB_PATH)}
+
+    inner = _graph.get_graph()
+    nodes = inner.nodes
+    node_ids = sorted(nodes.keys()) if isinstance(nodes, dict) else sorted(
+        n if isinstance(n, str) else getattr(n, "id", str(n)) for n in nodes
+    )
+
+    return {
+        "status": "ready",
+        "checkpointer": type(_saver).__name__,
+        "checkpoint_db": str(CHECKPOINT_DB_PATH),
+        "nodes": node_ids,
+        "node_count": len(node_ids),
+        "persisted_threads": await persisted_thread_count(),
+    }
